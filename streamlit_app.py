@@ -29,7 +29,8 @@ def extract_pdf_pages(pdf_file):
     with pdfplumber.open(pdf_file) as pdf:
         for i, page in enumerate(pdf.pages, 1):
             text = page.extract_text() or ""
-            pages.append((i, text))
+            tables = page.extract_tables() or []
+            pages.append((i, text, tables))
     return pages
 
 
@@ -109,6 +110,58 @@ def primary_number(text):
     return None
 
 
+def contextual_number(template_lang, pdf_text):
+    """Return the number from pdf_text most relevant to template_lang.
+
+    Uses context clues when pdf_text is a multi-number paragraph
+    (e.g. delinquency ranges, Low/High/WA labels).
+    Falls back to primary_number when no clue is found.
+    """
+    tl = template_lang.lower()
+
+    # Day-range clue: "30 to 59", "90 to 119", "150 or more"
+    day_match = re.search(r'(\d+)\s+(?:to\s+\d+|or\s+more)', tl)
+    if day_match:
+        pattern = re.escape(day_match.group(0))
+        m = re.search(pattern, pdf_text, re.I)
+        if m:
+            nearby = pdf_text[m.start(): m.start() + 200]
+            nums = extract_numbers(nearby)
+            for ntype in ("pct", "dollar", "count", "number", "integer"):
+                found = [n for n in nums if n[0] == ntype]
+                if found:
+                    return found[0][2] if ntype == "pct" else found[0][1]
+
+    # Low → smallest value
+    if re.search(r'\blow\b', tl):
+        nums = extract_numbers(pdf_text)
+        pcts = [n for n in nums if n[0] == "pct"]
+        if pcts:
+            return min(pcts, key=lambda n: n[1])[2]
+        dollars = [n for n in nums if n[0] == "dollar"]
+        if dollars:
+            return min(dollars, key=lambda n: n[1])[1]
+
+    # High → largest value
+    if re.search(r'\bhigh\b', tl):
+        nums = extract_numbers(pdf_text)
+        pcts = [n for n in nums if n[0] == "pct"]
+        if pcts:
+            return max(pcts, key=lambda n: n[1])[2]
+        dollars = [n for n in nums if n[0] == "dollar"]
+        if dollars:
+            return max(dollars, key=lambda n: n[1])[1]
+
+    # Weighted average / average → last percentage found
+    if re.search(r'\b(?:weighted\s+average|average|w\.?a\.?)\b', tl):
+        nums = extract_numbers(pdf_text)
+        pcts = [n for n in nums if n[0] == "pct"]
+        if pcts:
+            return pcts[-1][2]
+
+    return primary_number(pdf_text)
+
+
 def gather_number_sentences(pdf_pages):
     seen = set()
     rows = []
@@ -126,11 +179,19 @@ def gather_number_sentences(pdf_pages):
         seen.add(key)
         rows.append({"page": page_num, "language": chunk, "number": primary_number(chunk)})
 
-    for page_num, text in pdf_pages:
+    for page_num, text, tables in pdf_pages:
         for sent in split_sentences(text):
             add(page_num, sent)
         for line in text.splitlines():
             add(page_num, line.strip())
+        # Table rows: each row as a joined "Label  Value" chunk + individual cells
+        for table in tables:
+            for row in table:
+                cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                if len(cells) >= 2:
+                    add(page_num, "  ".join(cells))
+                for cell in cells:
+                    add(page_num, cell)
 
     return rows
 
@@ -277,7 +338,7 @@ if st.button("⚡ Extract & Download Excel", type="primary", use_container_width
                                 updated.append({
                                     "row_idx":  row["row_idx"],
                                     "language": match["language"],
-                                    "number":   match["number"],
+                                    "number":   contextual_number(lang, match["language"]),
                                 })
                             else:
                                 updated.append({
