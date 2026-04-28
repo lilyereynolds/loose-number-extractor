@@ -97,6 +97,10 @@ def extract_numbers(text):
     return results
 
 
+def _pct_to_decimal(val):
+    return val / 100
+
+
 def primary_number(text):
     if re.search(r'\[\s*\]', text):
         return "[ ]"
@@ -106,18 +110,12 @@ def primary_number(text):
     for ntype in ("dollar", "pct", "count", "number", "integer"):
         found = [n for n in nums if n[0] == ntype]
         if found:
-            return found[0][2] if ntype == "pct" else found[0][1]
+            return _pct_to_decimal(found[0][1]) if ntype == "pct" else found[0][1]
     return None
 
 
 def contextual_number(template_lang, pdf_text):
-    """Return the number from pdf_text most relevant to template_lang.
-
-    Uses context clues when pdf_text is a multi-number paragraph
-    (e.g. delinquency ranges, Low/High/WA labels).
-    Falls back to primary_number when no clue is found.
-    """
-    tl = template_lang.lower()
+    tl = template_lang.lower().strip()
 
     # Day-range clue: "30 to 59", "90 to 119", "150 or more"
     day_match = re.search(r'(\d+)\s+(?:to\s+\d+|or\s+more)', tl)
@@ -130,44 +128,51 @@ def contextual_number(template_lang, pdf_text):
             for ntype in ("pct", "dollar", "count", "number", "integer"):
                 found = [n for n in nums if n[0] == ntype]
                 if found:
-                    return found[0][2] if ntype == "pct" else found[0][1]
+                    v = found[0][1]
+                    return _pct_to_decimal(v) if ntype == "pct" else v
 
-    # Low → smallest value
-    if re.search(r'\blow\b', tl):
-        nums = extract_numbers(pdf_text)
-        pcts = [n for n in nums if n[0] == "pct"]
-        if pcts:
-            return min(pcts, key=lambda n: n[1])[2]
-        dollars = [n for n in nums if n[0] == "dollar"]
-        if dollars:
-            return min(dollars, key=lambda n: n[1])[1]
+    nums = extract_numbers(pdf_text)
 
-    # High → largest value
-    if re.search(r'\bhigh\b', tl):
-        nums = extract_numbers(pdf_text)
-        pcts = [n for n in nums if n[0] == "pct"]
-        if pcts:
-            return max(pcts, key=lambda n: n[1])[2]
-        dollars = [n for n in nums if n[0] == "dollar"]
-        if dollars:
-            return max(dollars, key=lambda n: n[1])[1]
+    # Low → smallest value of dominant type
+    if tl == "low":
+        for ntype in ("pct", "dollar", "number", "integer"):
+            found = [n for n in nums if n[0] == ntype]
+            if found:
+                v = min(found, key=lambda n: n[1])[1]
+                return _pct_to_decimal(v) if ntype == "pct" else v
 
-    # Weighted average / average → last percentage found
-    if re.search(r'\b(?:weighted\s+average|average|w\.?a\.?)\b', tl):
-        nums = extract_numbers(pdf_text)
-        pcts = [n for n in nums if n[0] == "pct"]
-        if pcts:
-            return pcts[-1][2]
+    # High → largest value of dominant type
+    if tl == "high":
+        for ntype in ("pct", "dollar", "number", "integer"):
+            found = [n for n in nums if n[0] == ntype]
+            if found:
+                v = max(found, key=lambda n: n[1])[1]
+                return _pct_to_decimal(v) if ntype == "pct" else v
+
+    # AVG / Average / WA → last value of dominant type
+    if re.search(r'\b(?:weighted\s+average|average|avg|w\.?a\.?)\b', tl):
+        for ntype in ("pct", "dollar", "number", "integer"):
+            found = [n for n in nums if n[0] == ntype]
+            if found:
+                v = found[-1][1]
+                return _pct_to_decimal(v) if ntype == "pct" else v
 
     return primary_number(pdf_text)
+
+
+_TOC_RE = re.compile(r'^\d{1,3}\s+\S.*\.{4}')  # "129 Title ......"
 
 
 def gather_number_sentences(pdf_pages):
     seen = set()
     rows = []
 
-    def add(page_num, chunk):
-        if len(chunk) < 10:
+    def add(page_num, chunk, label_only=False):
+        chunk = chunk.strip()
+        if len(chunk) < 4:
+            return
+        # Skip table-of-contents entries: start with page number + dotted leader
+        if _TOC_RE.match(chunk):
             return
         has_placeholder = bool(re.search(r'\[\s*\]', chunk))
         nums = extract_numbers(chunk)
@@ -184,12 +189,14 @@ def gather_number_sentences(pdf_pages):
             add(page_num, sent)
         for line in text.splitlines():
             add(page_num, line.strip())
-        # Table rows: each row as a joined "Label  Value" chunk + individual cells
+        # Table rows: add label+value joined chunk AND each cell individually
         for table in tables:
             for row in table:
                 cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
                 if len(cells) >= 2:
-                    add(page_num, "  ".join(cells))
+                    joined = "  ".join(cells)
+                    if len(joined) <= 300:  # skip mega-merged cells
+                        add(page_num, joined)
                 for cell in cells:
                     add(page_num, cell)
 
@@ -330,24 +337,45 @@ if st.button("⚡ Extract & Download Excel", type="primary", use_container_width
                 if excel_file:
                     template_wb, template_rows = load_template_excel(excel_file)
                     updated = []
+                    _CONTEXT_LABELS = {"low", "high", "avg", "average", "wa", "w.a."}
+                    last_match_chunk = None  # carries parent row context for Low/High/AVG
+
                     for row in template_rows:
                         lang = row["language"]
-                        if lang and isinstance(lang, str) and len(lang) > 20:
-                            match, score = best_pdf_match(lang, pdf_rows)
-                            if match:
-                                updated.append({
-                                    "row_idx":  row["row_idx"],
-                                    "language": match["language"],
-                                    "number":   contextual_number(lang, match["language"]),
-                                })
-                            else:
-                                updated.append({
-                                    "row_idx":  row["row_idx"],
-                                    "language": lang,
-                                    "number":   row["number"],
-                                })
-                        else:
+                        if not lang or not isinstance(lang, str) or not lang.strip():
                             updated.append({"row_idx": row["row_idx"], "language": None, "number": None})
+                            continue
+
+                        lang_stripped = lang.strip()
+                        tl = lang_stripped.lower()
+
+                        # Low/High/AVG: extract from the parent row's matched chunk
+                        if tl in _CONTEXT_LABELS and last_match_chunk:
+                            num = contextual_number(lang_stripped, last_match_chunk)
+                            updated.append({"row_idx": row["row_idx"], "language": None, "number": num})
+                            continue
+
+                        # Short labels (state names, status labels): allow matching but
+                        # keep original language in E, use higher threshold
+                        is_short = len(lang_stripped) <= 30
+                        threshold = 0.35 if is_short else 0.18
+
+                        match, score = best_pdf_match(lang_stripped, pdf_rows, threshold=threshold)
+                        if match:
+                            last_match_chunk = match["language"]
+                            # For short labels keep original E text; for sentences update E
+                            out_lang = lang_stripped if is_short else match["language"]
+                            updated.append({
+                                "row_idx":  row["row_idx"],
+                                "language": out_lang,
+                                "number":   contextual_number(lang_stripped, match["language"]),
+                            })
+                        else:
+                            updated.append({
+                                "row_idx":  row["row_idx"],
+                                "language": lang,
+                                "number":   row["number"],
+                            })
 
                     out_wb   = write_updated_excel(template_wb, updated)
                     out_name = f"{Path(pdf_file.name).stem}_Updated.xlsx"
@@ -378,4 +406,3 @@ st.markdown(
     "</div>",
     unsafe_allow_html=True,
 )
-
