@@ -114,6 +114,48 @@ def primary_number(text):
     return None
 
 
+def extract_ordered_numbers(text):
+    """Return all significant numbers from text in the order they appear."""
+    candidates = []
+
+    for m in re.finditer(r'\$[\d,]+(?:\.\d+)?', text):
+        try:
+            candidates.append((m.start(), m.end(), float(m.group().replace('$','').replace(',',''))))
+        except ValueError: pass
+
+    for m in re.finditer(r'(\d+(?:\.\d+)?)\s*%', text):
+        try:
+            candidates.append((m.start(), m.end(), float(m.group(1)) / 100))
+        except ValueError: pass
+
+    for m in re.finditer(r'(?<!\$)(\d{1,3}(?:,\d{3})+)', text):
+        try:
+            candidates.append((m.start(), m.end(), int(m.group().replace(',',''))))
+        except ValueError: pass
+
+    for m in re.finditer(r'(\d{1,4})\s+(?:months?|basis\s*points?|bps?)', text, re.I):
+        try:
+            candidates.append((m.start(), m.end(), int(m.group(1))))
+        except ValueError: pass
+
+    for m in re.finditer(r'(?<!\d)(\d{3,6})(?!\d)(?!%)', text):
+        try:
+            v = int(m.group(1))
+            if 2000 <= v <= 2099:
+                continue
+            candidates.append((m.start(), m.end(), v))
+        except ValueError: pass
+
+    candidates.sort(key=lambda x: x[0])
+    result = []
+    used_end = -1
+    for start, end, val in candidates:
+        if start >= used_end:
+            result.append(val)
+            used_end = end
+    return result
+
+
 def contextual_number(template_lang, pdf_text):
     tl = template_lang.lower().strip()
 
@@ -338,7 +380,8 @@ if st.button("⚡ Extract & Download Excel", type="primary", use_container_width
                     template_wb, template_rows = load_template_excel(excel_file)
                     updated = []
                     _CONTEXT_LABELS = {"low", "high", "avg", "average", "wa", "w.a."}
-                    last_match_chunk = None  # carries parent row context for Low/High/AVG
+                    last_match_chunk = None
+                    chunk_cursors = {}  # paragraph key -> next number index
 
                     for row in template_rows:
                         lang = row["language"]
@@ -349,26 +392,38 @@ if st.button("⚡ Extract & Download Excel", type="primary", use_container_width
                         lang_stripped = lang.strip()
                         tl = lang_stripped.lower()
 
-                        # Low/High/AVG: extract from the parent row's matched chunk
+                        # Low/High/AVG: use the last matched paragraph for context
                         if tl in _CONTEXT_LABELS and last_match_chunk:
                             num = contextual_number(lang_stripped, last_match_chunk)
                             updated.append({"row_idx": row["row_idx"], "language": None, "number": num})
                             continue
 
-                        # Short labels (state names, status labels): allow matching but
-                        # keep original language in E, use higher threshold
                         is_short = len(lang_stripped) <= 30
                         threshold = 0.35 if is_short else 0.18
 
                         match, score = best_pdf_match(lang_stripped, pdf_rows, threshold=threshold)
                         if match:
                             last_match_chunk = match["language"]
-                            # For short labels keep original E text; for sentences update E
                             out_lang = lang_stripped if is_short else match["language"]
+
+                            # Placeholder takes priority
+                            if re.search(r'\[\s*\]', match["language"]):
+                                num = "[ ]"
+                            else:
+                                ordered = extract_ordered_numbers(match["language"])
+                                if len(ordered) >= 2:
+                                    # Same paragraph hit multiple times: assign numbers in order
+                                    ck = match["language"][:200]
+                                    idx = chunk_cursors.get(ck, 0)
+                                    num = ordered[idx] if idx < len(ordered) else ordered[-1]
+                                    chunk_cursors[ck] = idx + 1
+                                else:
+                                    num = contextual_number(lang_stripped, match["language"])
+
                             updated.append({
                                 "row_idx":  row["row_idx"],
                                 "language": out_lang,
-                                "number":   contextual_number(lang_stripped, match["language"]),
+                                "number":   num,
                             })
                         else:
                             updated.append({
