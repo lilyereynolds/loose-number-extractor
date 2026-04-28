@@ -46,6 +46,19 @@ _STOPWORDS = {
 }
 
 
+def _is_page_ref(text, match_start):
+    prefix = text[max(0, match_start - 30): match_start]
+    if re.search(r'\.{3,}\s*$', prefix):               # after dotted leader  "......  129"
+        return True
+    if re.search(r'\bpage\s+$', prefix, re.I):          # "see page 45"
+        return True
+    if re.search(r'\bp\.\s*$', prefix, re.I):           # "p. 45"
+        return True
+    if re.search(r'\b(?:section|exhibit|appendix|schedule|annex|figure)\s+$', prefix, re.I):
+        return True
+    return False
+
+
 def extract_numbers(text):
     results = []
 
@@ -56,17 +69,20 @@ def extract_numbers(text):
         except ValueError:
             pass
 
-    # Percentages — exact PDF string preserved
+    # Percentages
     for m in re.finditer(r'(\d+(?:\.\d+)?)\s*%', text):
         try:
             results.append(("pct", float(m.group(1)), f"{m.group(1)}%"))
         except ValueError:
             pass
 
-    # Parenthetical counts  (242)
-    for m in re.finditer(r'\((\d{1,7})\)', text):
+    # Parenthetical counts (242) — skip footnote markers word(6) and small refs (1)–(20)
+    for m in re.finditer(r'(?<![a-zA-Z\d])\((\d{1,7})\)', text):
         try:
-            results.append(("count", int(m.group(1)), m.group()))
+            val = int(m.group(1))
+            if val <= 20:
+                continue
+            results.append(("count", val, m.group()))
         except ValueError:
             pass
 
@@ -84,19 +100,19 @@ def extract_numbers(text):
         except ValueError:
             pass
 
-    # Plain integers 3-6 digits (e.g. 436, 770) — skip years 2000-2099
+    # Plain integers 3-6 digits — skip years, page refs, footnote context
     for m in re.finditer(r'(?<!\d)(\d{3,6})(?!\d)(?!%)', text):
         try:
             val = int(m.group(1))
             if 2000 <= val <= 2099:
+                continue
+            if _is_page_ref(text, m.start()):
                 continue
             results.append(("integer", val, m.group(1)))
         except ValueError:
             pass
 
     return results
-
-
 def _pct_to_decimal(val):
     return val / 100
 
@@ -202,7 +218,11 @@ def contextual_number(template_lang, pdf_text):
     return primary_number(pdf_text)
 
 
-_TOC_RE = re.compile(r'^\d{1,3}\s+\S.*\.{4}')  # "129 Title ......"
+_TOC_RE = re.compile(
+    r'(?:^\d{1,3}\s+\S.*\.{3}'    # "129 Title ......"
+    r'|\.{4,}\s*\d{1,3}\s*$)',    # "Title ......  129"
+    re.MULTILINE,
+)
 
 
 def gather_number_sentences(pdf_pages):
