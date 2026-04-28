@@ -411,14 +411,14 @@ if st.button("⚡ Extract & Download Excel", type="primary", use_container_width
                                 num = "[ ]"
                             else:
                                 ordered = extract_ordered_numbers(match["language"])
-                                if len(ordered) >= 2:
-                                    # Same paragraph hit multiple times: assign numbers in order
-                                    ck = match["language"][:200]
-                                    idx = chunk_cursors.get(ck, 0)
+                                ck = match["language"][:200]
+                                idx = chunk_cursors.get(ck, 0)
+                                if ordered:
+                                    # Assign numbers in order — no repeats from the same paragraph
                                     num = ordered[idx] if idx < len(ordered) else ordered[-1]
                                     chunk_cursors[ck] = idx + 1
                                 else:
-                                    num = contextual_number(lang_stripped, match["language"])
+                                    num = None
 
                             updated.append({
                                 "row_idx":  row["row_idx"],
