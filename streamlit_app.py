@@ -48,11 +48,11 @@ _STOPWORDS = {
 
 def _is_page_ref(text, match_start):
     prefix = text[max(0, match_start - 30): match_start]
-    if re.search(r'\.{3,}\s*$', prefix):               # after dotted leader  "......  129"
+    if re.search(r'\.{3,}\s*$', prefix):
         return True
-    if re.search(r'\bpage\s+$', prefix, re.I):          # "see page 45"
+    if re.search(r'\bpage\s+$', prefix, re.I):
         return True
-    if re.search(r'\bp\.\s*$', prefix, re.I):           # "p. 45"
+    if re.search(r'\bp\.\s*$', prefix, re.I):
         return True
     if re.search(r'\b(?:section|exhibit|appendix|schedule|annex|figure)\s+$', prefix, re.I):
         return True
@@ -62,21 +62,18 @@ def _is_page_ref(text, match_start):
 def extract_numbers(text):
     results = []
 
-    # Dollar amounts
     for m in re.finditer(r'\$[\d,]+(?:\.\d+)?', text):
         try:
             results.append(("dollar", float(m.group().replace("$", "").replace(",", "")), m.group()))
         except ValueError:
             pass
 
-    # Percentages
     for m in re.finditer(r'(\d+(?:\.\d+)?)\s*%', text):
         try:
             results.append(("pct", float(m.group(1)), f"{m.group(1)}%"))
         except ValueError:
             pass
 
-    # Parenthetical counts (242) — skip footnote markers word(6) and small refs (1)–(20)
     for m in re.finditer(r'(?<![a-zA-Z\d])\((\d{1,7})\)', text):
         try:
             val = int(m.group(1))
@@ -86,21 +83,18 @@ def extract_numbers(text):
         except ValueError:
             pass
 
-    # Large comma-separated numbers  1,234,567
     for m in re.finditer(r'(?<!\$)\b(\d{1,3}(?:,\d{3})+)\b', text):
         try:
             results.append(("number", int(m.group().replace(",", "")), m.group()))
         except ValueError:
             pass
 
-    # Month / basis point counts
     for m in re.finditer(r'\b(\d{1,4})\s+(?:months?|basis points?|bps?)\b', text, re.I):
         try:
             results.append(("count", int(m.group(1)), m.group(1)))
         except ValueError:
             pass
 
-    # Plain integers 3-6 digits — skip years, page refs, footnote context
     for m in re.finditer(r'(?<!\d)(\d{3,6})(?!\d)(?!%)', text):
         try:
             val = int(m.group(1))
@@ -113,6 +107,8 @@ def extract_numbers(text):
             pass
 
     return results
+
+
 def _pct_to_decimal(val):
     return val / 100
 
@@ -130,44 +126,69 @@ def primary_number(text):
     return None
 
 
+def _raw_precision(raw_str):
+    """Count decimal places in a raw number string."""
+    s = re.sub(r'[$,]', '', raw_str.strip().rstrip('%'))
+    if '.' in s:
+        return len(s.split('.')[1])
+    return 0
+
+
 def extract_ordered_numbers(text):
-    """Return all significant numbers from text in the order they appear."""
+    """Return list of (value, precision) tuples from text in order of appearance.
+    Precision = decimal places of the value as stored in col F.
+    For percentages stored as decimals, precision = pct_decimal_places + 2.
+    """
     candidates = []
 
     for m in re.finditer(r'\$[\d,]+(?:\.\d+)?', text):
         try:
-            candidates.append((m.start(), m.end(), float(m.group().replace('$','').replace(',',''))))
-        except ValueError: pass
+            raw = m.group()
+            val = float(raw.replace('$', '').replace(',', ''))
+            prec = _raw_precision(raw)
+            candidates.append((m.start(), m.end(), val, prec))
+        except ValueError:
+            pass
 
     for m in re.finditer(r'(\d+(?:\.\d+)?)\s*%', text):
         try:
-            candidates.append((m.start(), m.end(), float(m.group(1)) / 100))
-        except ValueError: pass
+            raw_pct = m.group(1)
+            val = float(raw_pct) / 100
+            pct_prec = len(raw_pct.split('.')[1]) if '.' in raw_pct else 0
+            prec = pct_prec + 2
+            candidates.append((m.start(), m.end(), val, prec))
+        except ValueError:
+            pass
 
-    for m in re.finditer(r'(?<!\$)(\d{1,3}(?:,\d{3})+)', text):
+    for m in re.finditer(r'(?<!\$)(\d{1,3}(?:,\d{3})+)', text):
         try:
-            candidates.append((m.start(), m.end(), int(m.group().replace(',',''))))
-        except ValueError: pass
+            val = int(m.group().replace(',', ''))
+            candidates.append((m.start(), m.end(), val, 0))
+        except ValueError:
+            pass
 
-    for m in re.finditer(r'(\d{1,4})\s+(?:months?|basis\s*points?|bps?)', text, re.I):
+    for m in re.finditer(r'(\d{1,4})\s+(?:months?|basis\s*points?|bps?)', text, re.I):
         try:
-            candidates.append((m.start(), m.end(), int(m.group(1))))
-        except ValueError: pass
+            val = int(m.group(1))
+            candidates.append((m.start(), m.end(), val, 0))
+        except ValueError:
+            pass
 
     for m in re.finditer(r'(?<!\d)(\d{3,6})(?!\d)(?!%)', text):
         try:
             v = int(m.group(1))
             if 2000 <= v <= 2099:
                 continue
-            candidates.append((m.start(), m.end(), v))
-        except ValueError: pass
+            candidates.append((m.start(), m.end(), v, 0))
+        except ValueError:
+            pass
 
     candidates.sort(key=lambda x: x[0])
     result = []
     used_end = -1
-    for start, end, val in candidates:
+    for start, end, val, prec in candidates:
         if start >= used_end:
-            result.append(val)
+            result.append((val, prec))
             used_end = end
     return result
 
@@ -175,7 +196,6 @@ def extract_ordered_numbers(text):
 def contextual_number(template_lang, pdf_text):
     tl = template_lang.lower().strip()
 
-    # Day-range clue: "30 to 59", "90 to 119", "150 or more"
     day_match = re.search(r'(\d+)\s+(?:to\s+\d+|or\s+more)', tl)
     if day_match:
         pattern = re.escape(day_match.group(0))
@@ -191,7 +211,6 @@ def contextual_number(template_lang, pdf_text):
 
     nums = extract_numbers(pdf_text)
 
-    # Low → smallest value of dominant type
     if tl == "low":
         for ntype in ("pct", "dollar", "number", "integer"):
             found = [n for n in nums if n[0] == ntype]
@@ -199,7 +218,6 @@ def contextual_number(template_lang, pdf_text):
                 v = min(found, key=lambda n: n[1])[1]
                 return _pct_to_decimal(v) if ntype == "pct" else v
 
-    # High → largest value of dominant type
     if tl == "high":
         for ntype in ("pct", "dollar", "number", "integer"):
             found = [n for n in nums if n[0] == ntype]
@@ -207,7 +225,6 @@ def contextual_number(template_lang, pdf_text):
                 v = max(found, key=lambda n: n[1])[1]
                 return _pct_to_decimal(v) if ntype == "pct" else v
 
-    # AVG / Average / WA → last value of dominant type
     if re.search(r'\b(?:weighted\s+average|average|avg|w\.?a\.?)\b', tl):
         for ntype in ("pct", "dollar", "number", "integer"):
             found = [n for n in nums if n[0] == ntype]
@@ -219,8 +236,8 @@ def contextual_number(template_lang, pdf_text):
 
 
 _TOC_RE = re.compile(
-    r'(?:^\d{1,3}\s+\S.*\.{3}'    # "129 Title ......"
-    r'|\.{4,}\s*\d{1,3}\s*$)',    # "Title ......  129"
+    r'(?:^\d{1,3}\s+\S.*\.{3}'
+    r'|\.{4,}\s*\d{1,3}\s*$)',
     re.MULTILINE,
 )
 
@@ -233,7 +250,6 @@ def gather_number_sentences(pdf_pages):
         chunk = chunk.strip()
         if len(chunk) < 4:
             return
-        # Skip table-of-contents entries: start with page number + dotted leader
         if _TOC_RE.match(chunk):
             return
         has_placeholder = bool(re.search(r'\[\s*\]', chunk))
@@ -251,13 +267,12 @@ def gather_number_sentences(pdf_pages):
             add(page_num, sent)
         for line in text.splitlines():
             add(page_num, line.strip())
-        # Table rows: add label+value joined chunk AND each cell individually
         for table in tables:
             for row in table:
                 cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
                 if len(cells) >= 2:
                     joined = "  ".join(cells)
-                    if len(joined) <= 300:  # skip mega-merged cells
+                    if len(joined) <= 300:
                         add(page_num, joined)
                 for cell in cells:
                     add(page_num, cell)
@@ -333,8 +348,16 @@ def write_updated_excel(template_wb, updated_rows):
                 pass
             else:
                 ws.cell(row=r, column=6, value=new_val)
+        prec = entry.get("precision")
+        if prec is not None:
+            ws.cell(row=r, column=7, value=f"=ROUND(C{r},H{r})-F{r}")
+            ws.cell(row=r, column=8, value=prec)
+        else:
+            ws.cell(row=r, column=7, value="Handtie")
     ws.column_dimensions["E"].width = 90
     ws.column_dimensions["F"].width = 22
+    ws.column_dimensions["G"].width = 30
+    ws.column_dimensions["H"].width = 12
     return template_wb
 
 
@@ -376,7 +399,7 @@ st.info(
     "**Two modes:**\n"
     "- **PDF only** — extracts every sentence with a number into a fresh Excel (columns E & F).\n"
     "- **PDF + previous Excel** — matches each row's existing language to the new PDF and "
-    "updates the numbers in place.",
+    "updates columns E, F, G (Etie formula), and H (Precision) in place.",
     icon="ℹ️",
 )
 
@@ -401,21 +424,20 @@ if st.button("⚡ Extract & Download Excel", type="primary", use_container_width
                     updated = []
                     _CONTEXT_LABELS = {"low", "high", "avg", "average", "wa", "w.a."}
                     last_match_chunk = None
-                    chunk_cursors = {}  # paragraph key -> next number index
+                    chunk_cursors = {}
 
                     for row in template_rows:
                         lang = row["language"]
                         if not lang or not isinstance(lang, str) or not lang.strip():
-                            updated.append({"row_idx": row["row_idx"], "language": None, "number": None})
+                            updated.append({"row_idx": row["row_idx"], "language": None, "number": None, "precision": None})
                             continue
 
                         lang_stripped = lang.strip()
                         tl = lang_stripped.lower()
 
-                        # Low/High/AVG: use the last matched paragraph for context
                         if tl in _CONTEXT_LABELS and last_match_chunk:
                             num = contextual_number(lang_stripped, last_match_chunk)
-                            updated.append({"row_idx": row["row_idx"], "language": None, "number": num})
+                            updated.append({"row_idx": row["row_idx"], "language": None, "number": num, "precision": None})
                             continue
 
                         is_short = len(lang_stripped) <= 30
@@ -426,30 +448,31 @@ if st.button("⚡ Extract & Download Excel", type="primary", use_container_width
                             last_match_chunk = match["language"]
                             out_lang = lang_stripped if is_short else match["language"]
 
-                            # Placeholder takes priority
                             if re.search(r'\[\s*\]', match["language"]):
                                 num = "[ ]"
+                                prec = None
                             else:
                                 ordered = extract_ordered_numbers(match["language"])
                                 ck = match["language"][:200]
                                 idx = chunk_cursors.get(ck, 0)
                                 if ordered:
-                                    # Assign numbers in order — no repeats from the same paragraph
-                                    num = ordered[idx] if idx < len(ordered) else ordered[-1]
+                                    num, prec = ordered[idx] if idx < len(ordered) else ordered[-1]
                                     chunk_cursors[ck] = idx + 1
                                 else:
-                                    num = None
+                                    num, prec = None, None
 
                             updated.append({
-                                "row_idx":  row["row_idx"],
-                                "language": out_lang,
-                                "number":   num,
+                                "row_idx":   row["row_idx"],
+                                "language":  out_lang,
+                                "number":    num,
+                                "precision": prec,
                             })
                         else:
                             updated.append({
-                                "row_idx":  row["row_idx"],
-                                "language": lang,
-                                "number":   row["number"],
+                                "row_idx":   row["row_idx"],
+                                "language":  lang,
+                                "number":    row["number"],
+                                "precision": None,
                             })
 
                     out_wb   = write_updated_excel(template_wb, updated)
@@ -478,6 +501,7 @@ st.markdown(
     "<div style='text-align:center;color:#aaa;font-size:.8rem;'>"
     "Numbers extracted exactly as they appear in the PDF &nbsp;·&nbsp; "
     "Columns A–D left blank &nbsp;·&nbsp; Language → col E &nbsp;·&nbsp; Number → col F"
+    "&nbsp;·&nbsp; Etie formula → col G &nbsp;·&nbsp; Precision → col H"
     "</div>",
     unsafe_allow_html=True,
 )
